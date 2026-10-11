@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visão Guia</title>
+<style>body{margin:0;background:#000;color:#fff;font:20px Verdana,Arial,sans-serif}
+#comecar{position:fixed;inset:0;width:100%;height:100%;background:#ffd400;color:#000;border:0;font:700 2.2rem Verdana,Arial,sans-serif;padding:24px;z-index:9}
+#aviso{display:block;font-size:1.1rem;color:#b00020;margin-top:20px}
+main{padding:16px}#status{font-size:1.6rem;color:#ffd400}video{width:100%;max-height:35vh;object-fit:cover;border-radius:12px;background:#222}a{color:#ffd400}</style></head>
+<body>
+<button id="comecar" aria-label="Visão Guia. Toque duas vezes em qualquer parte do ecrã para começar.">👁️ VISÃO GUIA<br><br>TOQUE UMA VEZ NO ECRÃ PARA COMEÇAR<span id="aviso"></span></button>
+<main>
+<p id="status" role="status" aria-live="polite">Pronto.</p><p id="heard"></p>
+<video id="video" playsinline muted></video><p id="camInfo"></p><p id="navInfo"></p><a id="navMap" hidden target="_blank">Abrir caminho no mapa</a>
+<input id="dest" hidden><button id="camOn" hidden></button><button id="camOff" hidden></button><button id="navGo" hidden></button><button id="navStop" hidden></button>
+<p>Prototipo de assistência: não garante que o caminho esteja livre. Câmara, covas e escadas são experimentais.</p>
+</main>
+<script>// Serviço de voz (a ETAPA 2 vai juntar aqui o reconhecimento de voz).
+const Voice = {
+  last: "Bem-vindo ao Visão Guia MZ.", falando: false, fim: 0, ativo: false, n: 0,
+  rate: 1,
+  say(texto) {
+    this.last = texto;
+    const el = document.getElementById("status");
+    if (el) el.textContent = texto;
+    if (window.Nativo) { Nativo.falar(texto); return; }
+    if ("speechSynthesis" in window) {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(texto);
+      u.lang = "pt-PT";
+      u.rate = this.rate;
+      const id = ++this.n; this.falando = true;
+      u.onend = u.onerror = () => { if (id === this.n) { this.falando = false; this.fim = Date.now(); } };
+      speechSynthesis.speak(u);
+    }
+  },
+  repeat() { this.say(this.last); }
+};
+
+// Reconhecimento de voz (ETAPA 2). Precisa de https e de permissão do microfone.
+Voice.listen = function (aoOuvir, aoFalhar) {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { aoFalhar("Este navegador não tem reconhecimento de voz. Abra no Chrome do Android ou escreva o comando."); return; }
+  const r = new SR();
+  r.lang = "pt-PT"; r.interimResults = false; r.maxAlternatives = 1;
+  r.onresult = (e) => aoOuvir(e.results[0][0].transcript);
+  r.onerror = (e) => aoFalhar(e.error === "not-allowed" || e.error === "service-not-allowed"
+    ? "O microfone não está autorizado aqui. Autorize o microfone ou escreva o comando."
+    : e.error === "no-speech" ? "Não ouvi nada. Toque em FALAR e tente outra vez." : "Não consegui ouvir (" + e.error + ").");
+  try { r.start(); } catch (x) { aoFalhar("Não consegui ligar o microfone."); }
+};
+
+// Escuta contínua, mãos-livres: reinicia sozinha e ignora o que o próprio celular diz.
+Voice.continuo = function (aoOuvir) {
+  if (window.Nativo) { this.ativo = true; window.aoOuvirNativo = aoOuvir; Nativo.escutar(); return true; }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { this.say("Este navegador não tem reconhecimento de voz. Use o Chrome do Android."); return false; }
+  this.ativo = true;
+  const iniciar = () => {
+    if (!this.ativo) return;
+    const r = new SR(); r.lang = "pt-PT"; r.continuous = true; r.interimResults = false;
+    r.onresult = (e) => { const t = e.results[e.results.length - 1][0].transcript;
+      if (!this.falando && Date.now() - this.fim > 800) aoOuvir(t); };
+    r.onerror = (e) => { if (e.error === "not-allowed" || e.error === "service-not-allowed") { this.ativo = false; this.say("O microfone não está autorizado."); } };
+    r.onend = () => setTimeout(iniciar, 300);
+    try { r.start(); } catch (x) { setTimeout(iniciar, 1000); }
+    this.rec = r;
+  };
+  iniciar(); return true;
+};
+Voice.pararContinuo = function () { this.ativo = false; try { this.rec.stop(); } catch (e) {} };
+
+// Comandos de voz do Visão Guia (versão simples).
+let esperaDestino = false;
+const AJUDA = "Diga: quero ir ao mercado, ou o nome de outro lugar. Diga: começar caminhada, para ligar a câmara. Diga: parar, para parar tudo. Diga: ajuda, para ouvir isto outra vez.";
+function limpar(t) { return t.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[.,!?]/g, "").replace(/-/g, " ").trim(); }
+function tratar(texto) {
+  let t = limpar(texto).replace(/\b(activa|ativa|ativar)\b/g, "activar").replace(/\bliga\b/g, "ligar").replace(/\bdesliga\b/g, "desligar");
+  if (!t) return;
+  if (esperaDestino) { esperaDestino = false; if (/^(parar|cancelar)$/.test(t)) return Voice.say("Cancelado."); return iniciarNav(texto); }
+  if (/^(parar|pare|terminar|fim|cancelar)$/.test(t)) { pararCamera(); pararNav(); return Voice.say("Parado."); }
+  const m = t.match(/\b(?:ir|leva me|levar me|levame)\s+(?:para|ate|a|ao|as|aos)\s+(?:(?:o|a|os|as)\s+)?(.+)/);
+  if (m) return iniciarNav(m[1].replace(/ mais (proximo|perto)$/, ""));
+  if (/\b(desligar|fechar) .*cam[ae]ra/.test(t)) { pararCamera(); return Voice.say("Câmara desligada."); }
+  if (/comecar.*caminhada|\b(ligar|activar|iniciar|abrir) .*cam[ae]ra/.test(t)) return iniciarCamera();
+  if (/\b(ligar|activar|iniciar|abrir) .*(navegacao|gps|mapa)/.test(t)) {
+    esperaDestino = true; setTimeout(() => { esperaDestino = false; }, 20000);
+    return Voice.say("Navegação activa. Para onde quer ir?");
+  }
+  if (/o que (esta|ha).*frente/.test(t)) return verAgora();
+  if (/repetir|repete/.test(t)) return Voice.repeat();
+  if (/^(ajuda|comandos)$|o que posso dizer/.test(t)) return Voice.say(AJUDA);
+}
+
+// Câmara + objectos + covas/escadas experimentais + machimbombo (ETAPAS 3 a 6 e 9).
+// Tudo corre no celular. Nenhuma imagem é guardada nem enviada.
+const PT = { person: "Pessoa", car: "Carro", bus: "Possível machimbombo", truck: "Camião", bicycle: "Bicicleta",
+  motorcycle: "Mota", chair: "Cadeira", bench: "Banco", dog: "Cão", cat: "Gato", "potted plant": "Planta", couch: "Sofá",
+  "traffic light": "Semáforo", "stop sign": "Sinal de trânsito" };
+let stream = null, modelo = null, timer = null, ultimo = {}, ocupado = false;
+const cv = document.createElement("canvas"); cv.width = 64; cv.height = 48;
+
+function carregarScript(src) {
+  return new Promise((ok, erro) => { const s = document.createElement("script"); s.src = src; s.onload = ok;
+    s.onerror = () => erro(new Error(src)); document.head.appendChild(s); });
+}
+async function iniciarCamera(quieto) {
+  if (stream) return Voice.say("A câmara já está ligada.");
+  if (!navigator.mediaDevices) return Voice.say("Este navegador não permite usar a câmara.");
+  try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false }); }
+  catch (e) { return Voice.say("Não consegui abrir a câmara. Autorize a câmara no navegador."); }
+  const v = document.getElementById("video"); v.srcObject = stream; await v.play();
+  if (!quieto) Voice.say("Câmara ligada. A carregar o reconhecimento. Aguarde.");
+  try {
+    if (!modelo) {
+      await carregarScript("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js");
+      await carregarScript("https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js");
+      modelo = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+    }
+  } catch (e) { return Voice.say("Não consegui carregar o reconhecimento. Verifique a internet. A câmara continua ligada."); }
+  if (!quieto) Voice.say("Assistente de câmara iniciado. Aponte o celular para a frente, na vertical. Função experimental. Não consigo garantir que o caminho esteja livre.");
+  timer = setInterval(analisar, 1000);
+}
+function pararCamera() {
+  clearInterval(timer); timer = null;
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null; document.getElementById("video").srcObject = null;
+}
+function verAgora() { if (!stream) return iniciarCamera(); ultimo = {}; analisar(); }
+
+function avisar(chave, texto, info) {
+  document.getElementById("camInfo").textContent = info;
+  const t = Date.now(); if (t - (ultimo[chave] || 0) < 6000) return;
+  ultimo[chave] = t; Voice.say(texto);
+}
+// Escadas: várias linhas horizontais repetidas e regulares na parte de baixo da imagem.
+function escadas(g) {
+  const m = []; for (let y = 20; y < 48; y++) { let s = 0; for (let x = 16; x < 48; x++) s += g[y * 64 + x]; m.push(s / 32); }
+  const pk = []; for (let i = 1; i < m.length; i++) if (Math.abs(m[i] - m[i - 1]) > 10) pk.push(i);
+  const L = pk.filter((p, i) => i === 0 || p - pk[i - 1] > 1); if (L.length < 4) return 0;
+  const d = L.slice(1).map((p, i) => p - L[i]), med = d.reduce((a, b) => a + b) / d.length;
+  const desvio = Math.max(...d.map((x) => Math.abs(x - med)));
+  return desvio <= 2 && med >= 2 && med <= 9 ? Math.min(0.35 + 0.07 * L.length, 0.7) : 0;
+}
+// Cova: mancha escura e compacta no chão à frente (muitas sombras podem enganar).
+function cova(g) {
+  let s = 0, n = 0; for (let y = 28; y < 48; y++) for (let x = 14; x < 50; x++) { s += g[y * 64 + x]; n++; }
+  const m = s / n; let esc = 0;
+  for (let y = 28; y < 48; y++) for (let x = 14; x < 50; x++) if (g[y * 64 + x] < m * 0.55) esc++;
+  const f = esc / n; return f > 0.08 && f < 0.4 ? Math.min(0.3 + f, 0.55) : 0;
+}
+async function analisar() {
+  const v = document.getElementById("video");
+  if (ocupado || !modelo || !v.videoWidth) return; ocupado = true;
+  try {
+    const W = v.videoWidth, H = v.videoHeight, achados = [];
+    for (const p of await modelo.detect(v)) {
+      const nome = PT[p.class]; if (!nome || p.score < 0.6) continue;
+      const [x, y, w, h] = p.bbox, cx = (x + w / 2) / W, area = (w * h) / (W * H);
+      const lado = cx < 0.33 ? "à esquerda" : cx > 0.67 ? "à direita" : "à frente";
+      let txt = (p.class === "bus" ? "" : "Atenção. ") + nome + " " + lado + ".";
+      if (p.class === "bus") txt += " Não consegui identificar o número.";
+      if (area > 0.25) txt += " Está perto.";
+      achados.push({ area, txt, k: p.class + lado, info: nome + " " + lado + " (" + Math.round(p.score * 100) + "%)" });
+    }
+    if (achados.length) { achados.sort((a, b) => b.area - a.area); const a = achados[0]; return avisar(a.k, a.txt, a.info); }
+    const c = cv.getContext("2d", { willReadFrequently: true }); c.drawImage(v, 0, 0, 64, 48);
+    const px = c.getImageData(0, 0, 64, 48).data, g = new Float32Array(64 * 48);
+    for (let i = 0; i < g.length; i++) g[i] = 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+    const e = escadas(g), co = cova(g);
+    if (e >= 0.5 && e >= co) return avisar("esc", "Possíveis escadas à frente. Não sei se é para subir ou descer. Tenha cuidado.", "⚠️ Possíveis escadas (confiança " + Math.round(e * 100) + "%, experimental)");
+    if (co >= 0.5) return avisar("cova", "Atenção. Possível cova à frente. Confiança baixa.", "⚠️ Possível cova (confiança " + Math.round(co * 100) + "%, experimental)");
+    document.getElementById("camInfo").textContent = "Nada de relevante detectado (isto não garante que o caminho esteja livre).";
+    if (Date.now() - (ultimo.livre || 0) > 12000) { ultimo.livre = Date.now(); Voice.say("Não detecto obstáculos. Continue em frente, com cuidado."); }
+  } finally { ocupado = false; }
+}
+document.getElementById("camOn").onclick = iniciarCamera;
+document.getElementById("camOff").onclick = () => { pararCamera(); Voice.say("Câmara desligada."); };
+
+// Navegação a pé (ETAPA 7). Serviços gratuitos do OpenStreetMap, sem API KEY:
+// Nominatim (procura o destino) e routing.openstreetmap.de (calcula o caminho a pé).
+let watchNav = null, passos = [], passo = 0, destino = null, avisouPerto = false;
+function dist(a, b) {
+  const r = Math.PI / 180, R = 6371000, p = (b[0] - a[0]) * r, l = (b[1] - a[1]) * r;
+  const q = Math.sin(p / 2) ** 2 + Math.cos(a[0] * r) * Math.cos(b[0] * r) * Math.sin(l / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(q));
+}
+const posicao = () => new Promise((ok, erro) => navigator.geolocation.getCurrentPosition(
+  (p) => ok([p.coords.latitude, p.coords.longitude]), erro, { enableHighAccuracy: true, timeout: 15000 }));
+function instrucao(s) {
+  const m = s.maneuver; if (m.type === "arrive") return "Chegou ao destino.";
+  const mod = { left: "Vire à esquerda", right: "Vire à direita", "slight left": "Mantenha-se ligeiramente à esquerda",
+    "slight right": "Mantenha-se ligeiramente à direita", "sharp left": "Vire bem à esquerda",
+    "sharp right": "Vire bem à direita", uturn: "Volte para trás" }[m.modifier];
+  return mod || "Continue em frente.";
+}
+async function iniciarNav(nome) {
+  if (!navigator.geolocation) return Voice.say("Este aparelho não permite usar o GPS no navegador.");
+  if (!nome) return Voice.say("Diga ou escreva o destino.");
+  pararNav(); Voice.say("A procurar " + nome + ". Aguarde.");
+  try {
+    const a = await posicao();
+    let g = [];
+    for (const d of [0.02, 0.06, 0.2]) {   // procura cada vez mais longe, e escolhe o MAIS PRÓXIMO
+      const vb = [a[1] - d, a[0] + d, a[1] + d, a[0] - d].join(",");
+      g = await (await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=10&accept-language=pt&bounded=1&viewbox=" + vb + "&q=" + encodeURIComponent(nome))).json();
+      if (g.length) break;
+    }
+    if (!g.length) g = await (await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=mz&accept-language=pt&q=" + encodeURIComponent(nome))).json();
+    g.sort((x, y) => dist(a, [+x.lat, +x.lon]) - dist(a, [+y.lat, +y.lon]));
+    if (!g.length) return Voice.say("Não encontrei " + nome + ". Tente dizer o nome de outra forma.");
+    destino = [+g[0].lat, +g[0].lon];
+    const r = await (await fetch(`https://routing.openstreetmap.de/routed-foot/route/v1/foot/${a[1]},${a[0]};${destino[1]},${destino[0]}?steps=true&overview=false`)).json();
+    if (r.code !== "Ok") return Voice.say("Não consegui calcular o caminho a pé.");
+    passos = r.routes[0].legs[0].steps; passo = 0; avisouPerto = false;
+    const mapa = document.getElementById("navMap");
+    mapa.href = `https://www.openstreetmap.org/directions?engine=fossgis_osrm_foot&route=${a[0]},${a[1]};${destino[0]},${destino[1]}`; mapa.hidden = false;
+    document.getElementById("navInfo").textContent = "Destino: " + g[0].display_name;
+    Voice.say("Encontrei " + g[0].display_name.split(",")[0] + ", a " + Math.round(r.routes[0].distance) + " metros. Aponte o celular para a frente, na vertical. Continue em frente por " + Math.round(passos[0].distance) + " metros.");
+    iniciarCamera(true);
+    watchNav = navigator.geolocation.watchPosition(seguir, () => Voice.say("Perdi o sinal do GPS."), { enableHighAccuracy: true, maximumAge: 2000 });
+  } catch (e) { Voice.say("Não consegui iniciar a navegação. Verifique o GPS e a internet."); }
+}
+function seguir(p) {
+  const eu = [p.coords.latitude, p.coords.longitude];
+  if (dist(eu, destino) < 25) { Voice.say("Chegou ao destino."); return pararNav(); }
+  if (dist(eu, destino) < 80 && !avisouPerto) { avisouPerto = true; Voice.say("Está próximo do destino."); }
+  const prox = passos[passo + 1]; if (!prox) return;
+  const m = prox.maneuver.location;
+  if (dist(eu, [m[1], m[0]]) < 25) {
+    passo++;
+    Voice.say(instrucao(prox) + (prox.maneuver.type === "arrive" ? "" : " Depois continue por " + Math.round(prox.distance) + " metros."));
+  }
+}
+function pararNav() { if (watchNav !== null) navigator.geolocation.clearWatch(watchNav); watchNav = null; }
+document.getElementById("navGo").onclick = () => iniciarNav(document.getElementById("dest").value.trim());
+document.getElementById("navStop").onclick = () => { pararNav(); Voice.say("Navegação parada."); };
+
+const $ = (s) => document.querySelector(s);
+$("#comecar").onclick = async () => {
+  $("#comecar").hidden = true;
+  try { if (navigator.wakeLock) await navigator.wakeLock.request("screen"); } catch (e) {}
+  Voice.say((window.isSecureContext ? "" : "Atenção. A câmara, o microfone e o GPS não vão funcionar, porque a página não está num endereço https. ") + "Visão Guia. " + AJUDA);
+  Voice.continuo((t) => { $("#heard").textContent = "Ouvi: " + t; if (navigator.vibrate) navigator.vibrate(60); tratar(t); });
+};
+if (!window.isSecureContext) $("#aviso").textContent = "⚠️ Página sem https: câmara, microfone e GPS não vão funcionar.";
+if (window.Nativo) setTimeout(() => $("#comecar").onclick(), 800);
+</script></body></html>
